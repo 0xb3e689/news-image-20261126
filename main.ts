@@ -1,151 +1,188 @@
-// Standalone Node 22 entrypoint for make.fun competition news-image-20261126.
-// Validates PNG header geometry, chunk CRC-32 checksums, and the 1 MiB byte cap,
-// then deterministically writes the verified Thursday 26 November 2026 front page
-// to /output/entry.png (or MAKEFUN_OUTPUT_DIR/entry.png for local checks).
+// Node 22 standalone entrypoint for make.fun bounty news-image-20261126.
+// Uses Node's built-in zlib.crc32 and DataView chunk streaming to verify
+// entry.png (Thursday 26 November 2026, 40-story editorial broadsheet)
+// before atomically writing /output/entry.png.
 
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { crc32 as nativeCrc32 } from "node:zlib";
 
-const MAX_BYTES = 1_048_576;
-const MAX_DIMENSION = 1024;
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const LIMIT_BYTES = 1024 * 1024;
+const LIMIT_SIDE_PX = 1024;
+const MAGIC_BYTES = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
-function makeCrc32Lookup(): Uint32Array {
-  const lut = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    lut[n] = c >>> 0;
+type ChunkRecord = {
+  tag: string;
+  offset: number;
+  payload: Uint8Array;
+};
+
+type BroadsheetSpec = {
+  editionDate: string;
+  pixelWidth: number;
+  pixelHeight: number;
+  bitDepth: number;
+  colorMode: number;
+  paletteEntries: number;
+  compressedBytes: number;
+  chunkTotal: number;
+  fileBytes: number;
+  sha256Hex: string;
+};
+
+function matchesPngMagic(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < MAGIC_BYTES.byteLength) return false;
+  for (let idx = 0; idx < MAGIC_BYTES.byteLength; idx += 1) {
+    if (bytes[idx] !== MAGIC_BYTES[idx]) return false;
   }
-  return lut;
+  return true;
 }
 
-const CRC32_LUT = makeCrc32Lookup();
+function* streamPngChunks(bytes: Uint8Array): Generator<ChunkRecord, number> {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = MAGIC_BYTES.byteLength;
 
-function crc32(bytes: Uint8Array): number {
-  let state = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    state = CRC32_LUT[(state ^ bytes[i]) & 0xff] ^ (state >>> 8);
-  }
-  return (state ^ 0xffffffff) >>> 0;
-}
+  while (pos + 12 <= bytes.byteLength) {
+    const payloadLen = view.getUint32(pos, false);
+    const bodyStart = pos + 4;
+    const payloadStart = pos + 8;
+    const payloadEnd = payloadStart + payloadLen;
 
-interface VerifiedPngMeta {
-  width: number;
-  height: number;
-  chunks: number;
-  idatBytes: number;
-  totalBytes: number;
-  sha256: string;
-}
-
-function validatePngAsset(raw: Buffer): VerifiedPngMeta {
-  if (raw.length < 33 || raw.length > MAX_BYTES) {
-    throw new Error(`PNG size ${raw.length} out of bounds (33..${MAX_BYTES} bytes)`);
-  }
-  if (!raw.subarray(0, 8).equals(PNG_SIGNATURE)) {
-    throw new Error("Missing valid 8-byte PNG signature");
-  }
-
-  let cursor = 8;
-  let width = 0;
-  let height = 0;
-  let chunks = 0;
-  let idatBytes = 0;
-  let colorType = 0;
-  let foundIhdr = false;
-  let foundPlte = false;
-  let foundIend = false;
-
-  while (cursor + 12 <= raw.length) {
-    const length = raw.readUInt32BE(cursor);
-    const kind = raw.subarray(cursor + 4, cursor + 8).toString("ascii");
-    const payloadEnd = cursor + 8 + length;
-    if (payloadEnd + 4 > raw.length) {
-      throw new Error(`Truncated chunk ${kind} at offset ${cursor}`);
+    if (payloadEnd + 4 > bytes.byteLength) {
+      throw new Error(`Incomplete PNG chunk header at byte ${pos}`);
     }
 
-    const storedCrc = raw.readUInt32BE(payloadEnd);
-    const computedCrc = crc32(raw.subarray(cursor + 4, payloadEnd));
-    if (computedCrc !== storedCrc) {
-      throw new Error(`Chunk ${kind} failed CRC-32 check at offset ${cursor}`);
+    const expectedChecksum = view.getUint32(payloadEnd, false);
+    const actualChecksum = nativeCrc32(bytes.subarray(bodyStart, payloadEnd));
+    if (actualChecksum !== expectedChecksum) {
+      throw new Error(`PNG checksum failure at byte ${pos}`);
     }
 
-    if (chunks === 0) {
-      if (kind !== "IHDR" || length !== 13) {
-        throw new Error("First PNG chunk must be a 13-byte IHDR");
-      }
-      width = raw.readUInt32BE(cursor + 8);
-      height = raw.readUInt32BE(cursor + 12);
-      const bitDepth = raw[cursor + 16];
-      colorType = raw[cursor + 17];
-      const allowedDepths = new Set([1, 2, 4, 8, 16]);
-      const allowedColors = new Set([0, 2, 3, 4, 6]);
-      if (width < 1 || height < 1 || width > MAX_DIMENSION || height > MAX_DIMENSION) {
-        throw new Error(`Dimensions ${width}x${height} exceed ${MAX_DIMENSION}x${MAX_DIMENSION}`);
-      }
-      if (!allowedDepths.has(bitDepth) || !allowedColors.has(colorType)) {
-        throw new Error(`Unsupported IHDR bitDepth=${bitDepth}, colorType=${colorType}`);
-      }
-      foundIhdr = true;
-    } else if (kind === "PLTE") {
-      if (length === 0 || length % 3 !== 0 || length > 768) {
-        throw new Error(`Invalid PLTE palette length ${length}`);
-      }
-      foundPlte = true;
-    } else if (kind === "IDAT") {
-      idatBytes += length;
-    } else if (kind === "IEND") {
-      if (length !== 0) {
-        throw new Error("IEND chunk must have length 0");
-      }
-      foundIend = true;
-      cursor = payloadEnd + 4;
-      chunks += 1;
-      break;
-    }
+    const tag = String.fromCharCode(
+      bytes[bodyStart],
+      bytes[bodyStart + 1],
+      bytes[bodyStart + 2],
+      bytes[bodyStart + 3]
+    );
+    const payload = bytes.subarray(payloadStart, payloadEnd);
 
-    cursor = payloadEnd + 4;
-    chunks += 1;
+    yield { tag, offset: pos, payload };
+    pos = payloadEnd + 4;
+    if (tag === "IEND") return pos;
   }
 
-  if (!foundIhdr || !foundIend || idatBytes === 0 || cursor !== raw.length) {
-    throw new Error("Incomplete PNG stream or trailing bytes after IEND");
-  }
-  if (colorType === 3 && !foundPlte) {
-    throw new Error("Indexed-color PNG (colorType=3) is missing required PLTE palette chunk");
-  }
-
-  const sha256 = crypto.createHash("sha256").update(raw).digest("hex");
-  return { width, height, chunks, idatBytes, totalBytes: raw.length, sha256 };
+  return pos;
 }
 
-function main(): void {
-  const repoRoot = path.dirname(fileURLToPath(import.meta.url));
-  const sourceImage = path.resolve(repoRoot, "entry.png");
-  const buffer = fs.readFileSync(sourceImage);
-  const meta = validatePngAsset(buffer);
+function verifyBroadsheetPng(raw: Uint8Array): BroadsheetSpec {
+  if (raw.byteLength < 33 || raw.byteLength > LIMIT_BYTES) {
+    throw new Error(`Asset length ${raw.byteLength} violates 1 MiB ceiling`);
+  }
+  if (!matchesPngMagic(raw)) {
+    throw new Error("Asset header is not a valid PNG file");
+  }
 
-  const outDir = path.resolve(process.env.MAKEFUN_OUTPUT_DIR ?? "/output");
-  const outPath = path.join(outDir, "entry.png");
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(outPath, buffer);
+  let pixelWidth = 0;
+  let pixelHeight = 0;
+  let bitDepth = 0;
+  let colorMode = 0;
+  let paletteEntries = 0;
+  let compressedBytes = 0;
+  let chunkTotal = 0;
+  let sawEnd = false;
 
-  const roundTripHash = crypto
-    .createHash("sha256")
-    .update(fs.readFileSync(outPath))
-    .digest("hex");
-  if (roundTripHash !== meta.sha256) {
-    throw new Error("Output integrity hash mismatch after write");
+  const walker = streamPngChunks(raw);
+  let step = walker.next();
+
+  while (!step.done) {
+    const { tag, payload } = step.value;
+    if (chunkTotal === 0) {
+      if (tag !== "IHDR" || payload.byteLength !== 13) {
+        throw new Error("Opening chunk must be a 13-byte IHDR record");
+      }
+      const hdr = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+      pixelWidth = hdr.getUint32(0, false);
+      pixelHeight = hdr.getUint32(4, false);
+      bitDepth = payload[8];
+      colorMode = payload[9];
+
+      if (
+        pixelWidth < 1 ||
+        pixelHeight < 1 ||
+        pixelWidth > LIMIT_SIDE_PX ||
+        pixelHeight > LIMIT_SIDE_PX
+      ) {
+        throw new Error(`Image geometry ${pixelWidth}x${pixelHeight} exceeds 1024x1024`);
+      }
+    } else if (tag === "PLTE") {
+      if (payload.byteLength === 0 || payload.byteLength % 3 !== 0 || payload.byteLength > 768) {
+        throw new Error(`Malformed PLTE palette table (${payload.byteLength} bytes)`);
+      }
+      paletteEntries = payload.byteLength / 3;
+    } else if (tag === "IDAT") {
+      compressedBytes += payload.byteLength;
+    } else if (tag === "IEND") {
+      if (payload.byteLength !== 0) {
+        throw new Error("IEND marker must carry zero payload bytes");
+      }
+      sawEnd = true;
+    }
+
+    chunkTotal += 1;
+    step = walker.next();
+  }
+
+  const finalOffset = step.value;
+  if (!sawEnd || compressedBytes === 0 || finalOffset !== raw.byteLength) {
+    throw new Error("PNG stream ended prematurely or contains trailing garbage");
+  }
+  if (colorMode === 3 && paletteEntries === 0) {
+    throw new Error("Indexed PNG requires a valid PLTE palette chunk");
+  }
+
+  return {
+    editionDate: "2026-11-26",
+    pixelWidth,
+    pixelHeight,
+    bitDepth,
+    colorMode,
+    paletteEntries,
+    compressedBytes,
+    chunkTotal,
+    fileBytes: raw.byteLength,
+    sha256Hex: createHash("sha256").update(raw).digest("hex"),
+  };
+}
+
+function publishBroadsheet(): void {
+  const entryDir = dirname(fileURLToPath(import.meta.url));
+  const inputPath = resolve(entryDir, "entry.png");
+  const rawAsset = readFileSync(inputPath);
+  const spec = verifyBroadsheetPng(rawAsset);
+
+  const targetDir = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? "/output");
+  const targetPath = join(targetDir, "entry.png");
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(targetPath, rawAsset);
+
+  const writtenHash = createHash("sha256").update(readFileSync(targetPath)).digest("hex");
+  if (writtenHash !== spec.sha256Hex) {
+    throw new Error("Written broadsheet checksum did not match source asset");
   }
 
   console.log(
-    `Wrote ${outPath} (${meta.width}x${meta.height}, ${meta.totalBytes} bytes, ${meta.chunks} chunks, sha256:${meta.sha256.slice(0, 12)})`
+    JSON.stringify({
+      edition: spec.editionDate,
+      output: targetPath,
+      dimensions: `${spec.pixelWidth}x${spec.pixelHeight}`,
+      bytes: spec.fileBytes,
+      paletteColors: spec.paletteEntries,
+      chunks: spec.chunkTotal,
+      sha256: spec.sha256Hex.slice(0, 16),
+    })
   );
 }
 
-main();
+publishBroadsheet();
