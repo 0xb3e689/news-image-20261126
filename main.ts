@@ -1,6 +1,6 @@
 // Node 22 standalone entrypoint for make.fun bounty news-image-20261126.
 // Uses Node's built-in zlib.crc32 and DataView chunk streaming to verify
-// entry.png (Thursday 26 November 2026, 40-story editorial broadsheet)
+// entry.png (Thursday 26 November 2026, 35-story editorial broadsheet)
 // before atomically writing /output/entry.png.
 
 import { createHash } from "node:crypto";
